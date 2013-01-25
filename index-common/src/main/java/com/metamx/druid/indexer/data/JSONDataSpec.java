@@ -19,14 +19,10 @@
 
 package com.metamx.druid.indexer.data;
 
-import com.google.common.base.Function;
-import com.google.common.collect.Lists;
 import com.metamx.common.parsers.JSONParser;
 import com.metamx.common.parsers.Parser;
-import com.metamx.common.parsers.ToLowerCaseParser;
 import org.codehaus.jackson.annotate.JsonProperty;
 
-import javax.annotation.Nullable;
 import java.util.List;
 
 /**
@@ -39,17 +35,7 @@ public class JSONDataSpec implements DataSpec
       @JsonProperty("dimensions") List<String> dimensions
   )
   {
-    this.dimensions = (dimensions == null) ? dimensions : Lists.transform(
-        dimensions,
-        new Function<String, String>()
-        {
-          @Override
-          public String apply(@Nullable String input)
-          {
-            return input.toLowerCase();
-          }
-        }
-    );
+    this.dimensions = dimensions;
   }
 
   @JsonProperty("dimensions")
@@ -71,8 +57,8 @@ public class JSONDataSpec implements DataSpec
   }
 
   @Override
-  public Parser getParser()
+  public Parser<String, Object> getParser()
   {
-    return new ToLowerCaseParser(new JSONParser());
+    return new JSONParser();
   }
 }

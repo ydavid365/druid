@@ -33,26 +33,34 @@ import com.metamx.common.Pair;
 import com.metamx.common.concurrent.ScheduledExecutors;
 import com.metamx.common.guava.FunctionalIterable;
 import com.metamx.druid.Query;
+import com.metamx.druid.StorageAdapter;
 import com.metamx.druid.client.DataSegment;
 import com.metamx.druid.client.DruidServer;
 import com.metamx.druid.client.ServerView;
+import com.metamx.druid.guava.ThreadRenamingRunnable;
+import com.metamx.druid.index.QueryableIndex;
+import com.metamx.druid.index.QueryableIndexSegment;
+import com.metamx.druid.index.Segment;
 import com.metamx.druid.index.v1.IndexGranularity;
 import com.metamx.druid.index.v1.IndexIO;
 import com.metamx.druid.index.v1.IndexMerger;
 import com.metamx.druid.index.v1.MMappedIndex;
+import com.metamx.druid.index.v1.MMappedIndexQueryableIndex;
 import com.metamx.druid.index.v1.MMappedIndexStorageAdapter;
+import com.metamx.druid.loading.SegmentPusher;
 import com.metamx.druid.query.MetricsEmittingQueryRunner;
 import com.metamx.druid.query.QueryRunner;
 import com.metamx.druid.query.QueryRunnerFactory;
 import com.metamx.druid.query.QueryRunnerFactoryConglomerate;
 import com.metamx.druid.query.QueryToolChest;
-import com.metamx.druid.shard.NoneShardSpec;
 import com.metamx.emitter.EmittingLogger;
 import com.metamx.emitter.service.ServiceEmitter;
 import com.metamx.emitter.service.ServiceMetricEvent;
 import org.apache.commons.io.FileUtils;
 import org.codehaus.jackson.annotate.JsonCreator;
 import org.codehaus.jackson.annotate.JsonProperty;
+import org.codehaus.jackson.annotate.JsonSubTypes;
+import org.codehaus.jackson.annotate.JsonTypeInfo;
 import org.codehaus.jackson.map.annotate.JacksonInject;
 import org.joda.time.DateTime;
 import org.joda.time.Duration;
@@ -84,6 +92,7 @@ public class RealtimePlumberSchool implements PlumberSchool
   private volatile Executor persistExecutor = null;
   private volatile ScheduledExecutorService scheduledExecutor = null;
 
+  private volatile RejectionPolicyFactory rejectionPolicyFactory = null;
   private volatile QueryRunnerFactoryConglomerate conglomerate = null;
   private volatile SegmentPusher segmentPusher = null;
   private volatile MetadataUpdater metadataUpdater = null;
@@ -100,10 +109,17 @@ public class RealtimePlumberSchool implements PlumberSchool
     this.windowPeriod = windowPeriod;
     this.basePersistDirectory = basePersistDirectory;
     this.segmentGranularity = segmentGranularity;
+    this.rejectionPolicyFactory = new ServerTimeRejectionPolicyFactory();
 
     Preconditions.checkNotNull(windowPeriod, "RealtimePlumberSchool requires a windowPeriod.");
     Preconditions.checkNotNull(basePersistDirectory, "RealtimePlumberSchool requires a basePersistDirectory.");
     Preconditions.checkNotNull(segmentGranularity, "RealtimePlumberSchool requires a segmentGranularity.");
+  }
+
+  @JsonProperty("rejectionPolicy")
+  public void setRejectionPolicyFactory(RejectionPolicyFactory factory)
+  {
+    this.rejectionPolicyFactory = factory;
   }
 
   @JacksonInject("queryRunnerFactoryConglomerate")
@@ -174,7 +190,7 @@ public class RealtimePlumberSchool implements PlumberSchool
           log.info("Loading previously persisted segment at [%s]", segmentDir);
           hydrants.add(
               new FireHydrant(
-                  new MMappedIndexStorageAdapter(IndexIO.mapDir(segmentDir)),
+                  new QueryableIndexSegment(null, IndexIO.loadIndex(segmentDir)),
                   Integer.parseInt(segmentDir.getName())
               )
           );
@@ -203,7 +219,7 @@ public class RealtimePlumberSchool implements PlumberSchool
               return ServerView.CallbackAction.CONTINUE;
             }
 
-            log.info("Checking segment[%s]", segment);
+            log.debug("Checking segment[%s] on server[%s]", segment, server);
             if (schema.getDataSource().equals(segment.getDataSource())) {
               final Interval interval = segment.getInterval();
               for (Map.Entry<Long, Sink> entry : sinks.entrySet()) {
@@ -235,14 +251,13 @@ public class RealtimePlumberSchool implements PlumberSchool
 
     final long truncatedNow = segmentGranularity.truncate(new DateTime()).getMillis();
     final long windowMillis = windowPeriod.toStandardDuration().getMillis();
+    final RejectionPolicy rejectionPolicy = rejectionPolicyFactory.create(windowPeriod);
+    log.info("Creating plumber using rejectionPolicy[%s]", rejectionPolicy);
 
     log.info(
         "Expect to run at [%s]",
         new DateTime().plus(
-            new Duration(
-                System.currentTimeMillis(),
-                segmentGranularity.increment(truncatedNow) + windowMillis
-            )
+            new Duration(System.currentTimeMillis(), segmentGranularity.increment(truncatedNow) + windowMillis)
         )
     );
 
@@ -251,14 +266,14 @@ public class RealtimePlumberSchool implements PlumberSchool
             scheduledExecutor,
             new Duration(System.currentTimeMillis(), segmentGranularity.increment(truncatedNow) + windowMillis),
             new Duration(truncatedNow, segmentGranularity.increment(truncatedNow)),
-            new Runnable()
+            new ThreadRenamingRunnable(String.format("%s-overseer", schema.getDataSource()))
             {
               @Override
-              public void run()
+              public void doRun()
               {
                 log.info("Starting merge and push.");
 
-                long minTimestamp = segmentGranularity.truncate(new DateTime()).getMillis() - windowMillis;
+                long minTimestamp = segmentGranularity.truncate(rejectionPolicy.getCurrMaxTime()).getMillis() - windowMillis;
 
                 List<Map.Entry<Long, Sink>> sinksToPush = Lists.newArrayList();
                 for (Map.Entry<Long, Sink> entry : sinks.entrySet()) {
@@ -272,11 +287,14 @@ public class RealtimePlumberSchool implements PlumberSchool
                 for (final Map.Entry<Long, Sink> entry : sinksToPush) {
                   final Sink sink = entry.getValue();
 
+                  final String threadName = String.format(
+                      "%s-%s-persist-n-merge", schema.getDataSource(), new DateTime(entry.getKey())
+                  );
                   persistExecutor.execute(
-                      new Runnable()
+                      new ThreadRenamingRunnable(threadName)
                       {
                         @Override
-                        public void run()
+                        public void doRun()
                         {
                           final Interval interval = sink.getInterval();
 
@@ -290,33 +308,25 @@ public class RealtimePlumberSchool implements PlumberSchool
 
                           final File mergedFile;
                           try {
-                            final File persistDir = computePersistDir(schema, interval);
-
-                            final File[] persistedIndexes = persistDir.listFiles();
-                            List<MMappedIndex> indexes = Lists.newArrayList();
-                            for (File persistedIndex : persistedIndexes) {
-                              log.info("Adding index at [%s]", persistedIndex);
-                              indexes.add(IndexIO.mapDir(persistedIndex));
+                            List<QueryableIndex> indexes = Lists.newArrayList();
+                            for (FireHydrant fireHydrant : sink) {
+                              Segment segment = fireHydrant.getSegment();
+                              final QueryableIndex queryableIndex = segment.asQueryableIndex();
+                              log.info("Adding hydrant[%s]", fireHydrant);
+                              indexes.add(queryableIndex);
                             }
 
-                            mergedFile = IndexMerger.mergeMMapped(
-                                indexes, schema.getAggregators(), new File(persistDir, "merged")
+                            mergedFile = IndexMerger.mergeQueryableIndex(
+                                indexes,
+                                schema.getAggregators(),
+                                new File(computePersistDir(schema, interval), "merged")
                             );
 
-                            MMappedIndex index = IndexIO.mapDir(mergedFile);
+                            QueryableIndex index = IndexIO.loadIndex(mergedFile);
 
                             DataSegment segment = segmentPusher.push(
                                 mergedFile,
-                                new DataSegment(
-                                    schema.getDataSource(),
-                                    interval,
-                                    interval.getStart().toString(),
-                                    null,
-                                    Lists.newArrayList(index.getAvailableDimensions()),
-                                    Lists.newArrayList(index.getAvailableMetrics()),
-                                    new NoneShardSpec(),
-                                    0
-                                )
+                                sink.getSegment().withDimensions(Lists.newArrayList(index.getAvailableDimensions()))
                             );
 
                             metadataUpdater.publishSegment(segment);
@@ -325,7 +335,6 @@ public class RealtimePlumberSchool implements PlumberSchool
                             log.makeAlert(e, "Failed to persist merged index[%s]", schema.getDataSource())
                                .addData("interval", interval)
                                .emit();
-                            return;
                           }
                         }
                       }
@@ -340,7 +349,7 @@ public class RealtimePlumberSchool implements PlumberSchool
       @Override
       public Sink getSink(long timestamp)
       {
-        if (timestamp < System.currentTimeMillis() - windowMillis) { //  reject if too old
+        if (!rejectionPolicy.accept(timestamp)) {
           return null;
         }
 
@@ -408,7 +417,7 @@ public class RealtimePlumberSchool implements PlumberSchool
                                       @Override
                                       public QueryRunner<T> apply(@Nullable FireHydrant input)
                                       {
-                                        return factory.createRunner(input.getAdapter());
+                                        return factory.createRunner(input.getSegment());
                                       }
                                     }
                                 )
@@ -430,11 +439,13 @@ public class RealtimePlumberSchool implements PlumberSchool
           }
         }
 
+        log.info("Submitting persist runnable for dataSource[%s]", schema.getDataSource());
+
         persistExecutor.execute(
-            new Runnable()
+            new ThreadRenamingRunnable(String.format("%s-incremental-persist", schema.getDataSource()))
             {
               @Override
-              public void run()
+              public void doRun()
               {
                 for (Pair<FireHydrant, Interval> pair : indexesToPersist) {
                   metrics.incrementRowOutputCount(persistHydrant(pair.lhs, schema, pair.rhs));
@@ -483,7 +494,7 @@ public class RealtimePlumberSchool implements PlumberSchool
           new File(computePersistDir(schema, interval), String.valueOf(indexToPersist.getCount()))
       );
 
-      indexToPersist.swapAdapter(new MMappedIndexStorageAdapter(IndexIO.mapDir(persistedFile)));
+      indexToPersist.swapSegment(new QueryableIndexSegment(null, IndexIO.loadIndex(persistedFile)));
 
       return numRows;
     }
@@ -499,7 +510,7 @@ public class RealtimePlumberSchool implements PlumberSchool
 
   private void verifyState()
   {
-    Preconditions.checkNotNull(conglomerate, "must specify a queryRunnerFactoryConglomerate to do action.");
+    Preconditions.checkNotNull(conglomerate, "must specify a queryRunnerFactoryConglomerate to do this action.");
     Preconditions.checkNotNull(segmentPusher, "must specify a segmentPusher to do this action.");
     Preconditions.checkNotNull(metadataUpdater, "must specify a metadataUpdater to do this action.");
     Preconditions.checkNotNull(serverView, "must specify a serverView to do this action.");
@@ -525,6 +536,86 @@ public class RealtimePlumberSchool implements PlumberSchool
               .setNameFormat("plumber_scheduled_%d")
               .build()
       );
+    }
+  }
+
+  public interface RejectionPolicy
+  {
+    public DateTime getCurrMaxTime();
+    public boolean accept(long timestamp);
+  }
+
+  @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
+  @JsonSubTypes(value = {
+      @JsonSubTypes.Type(name = "serverTime", value = ServerTimeRejectionPolicyFactory.class),
+      @JsonSubTypes.Type(name = "messageTime", value = MessageTimeRejectionPolicyFactory.class)
+  })
+  public static interface RejectionPolicyFactory
+  {
+    public RejectionPolicy create(Period windowPeriod);
+  }
+
+  public static class ServerTimeRejectionPolicyFactory implements RejectionPolicyFactory
+  {
+    @Override
+    public RejectionPolicy create(final Period windowPeriod)
+    {
+      final long windowMillis = windowPeriod.toStandardDuration().getMillis();
+
+      return new RejectionPolicy()
+      {
+        @Override
+        public DateTime getCurrMaxTime()
+        {
+          return new DateTime();
+        }
+
+        @Override
+        public boolean accept(long timestamp)
+        {
+          return timestamp >= (System.currentTimeMillis() - windowMillis);
+        }
+
+        @Override
+        public String toString()
+        {
+          return String.format("serverTime-%s", windowPeriod);
+        }
+      };
+    }
+  }
+
+  public static class MessageTimeRejectionPolicyFactory implements RejectionPolicyFactory
+  {
+    @Override
+    public RejectionPolicy create(final Period windowPeriod)
+    {
+      final long windowMillis = windowPeriod.toStandardDuration().getMillis();
+
+      return new RejectionPolicy()
+      {
+        private volatile long maxTimestamp = Long.MIN_VALUE;
+
+        @Override
+        public DateTime getCurrMaxTime()
+        {
+          return new DateTime(maxTimestamp);
+        }
+
+        @Override
+        public boolean accept(long timestamp)
+        {
+          maxTimestamp = Math.max(maxTimestamp, timestamp);
+
+          return timestamp >= (maxTimestamp - windowMillis);
+        }
+
+        @Override
+        public String toString()
+        {
+          return String.format("messageTime-%s", windowPeriod);
+        }
+      };
     }
   }
 }

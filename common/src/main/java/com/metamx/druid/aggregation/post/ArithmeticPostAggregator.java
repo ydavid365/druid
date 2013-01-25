@@ -20,6 +20,7 @@
 package com.metamx.druid.aggregation.post;
 
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.metamx.common.IAE;
 import org.codehaus.jackson.annotate.JsonCreator;
 import org.codehaus.jackson.annotate.JsonProperty;
@@ -69,6 +70,16 @@ public class ArithmeticPostAggregator implements PostAggregator
   }
 
   @Override
+  public Set<String> getDependentFields()
+  {
+    Set<String> dependentFields = Sets.newHashSet();
+    for (PostAggregator field : fields) {
+      dependentFields.addAll(field.getDependentFields());
+    }
+    return dependentFields;
+  }
+
+  @Override
   public Comparator getComparator()
   {
     return COMPARATOR;
@@ -78,11 +89,13 @@ public class ArithmeticPostAggregator implements PostAggregator
   public Object compute(Map<String, Object> values)
   {
     Iterator<PostAggregator> fieldsIter = fields.iterator();
-    double retVal = ((Number) fieldsIter.next().compute(values)).doubleValue();
-    while (fieldsIter.hasNext()) {
-      retVal = op.compute(retVal, ((Number) fieldsIter.next().compute(values)).doubleValue());
+    double retVal = 0.0;
+    if (fieldsIter.hasNext()) {
+      retVal = ((Number) fieldsIter.next().compute(values)).doubleValue();
+      while (fieldsIter.hasNext()) {
+        retVal = op.compute(retVal, ((Number) fieldsIter.next().compute(values)).doubleValue());
+      }
     }
-
     return retVal;
   }
 
@@ -118,26 +131,34 @@ public class ArithmeticPostAggregator implements PostAggregator
 
   private static enum Ops
   {
-    PLUS("+") {
-          double compute(double lhs, double rhs) {
+    PLUS("+")
+        {
+          double compute(double lhs, double rhs)
+          {
             return lhs + rhs;
           }
-    },
-    MINUS("-"){
-          double compute(double lhs, double rhs) {
+        },
+    MINUS("-")
+        {
+          double compute(double lhs, double rhs)
+          {
             return lhs - rhs;
           }
-    },
-    MULT("*"){
-          double compute(double lhs, double rhs) {
+        },
+    MULT("*")
+        {
+          double compute(double lhs, double rhs)
+          {
             return lhs * rhs;
           }
-    },
-    DIV("/"){
-          double compute(double lhs, double rhs) {
+        },
+    DIV("/")
+        {
+          double compute(double lhs, double rhs)
+          {
             return (rhs == 0.0) ? 0 : (lhs / rhs);
           }
-    };
+        };
 
     private static final Map<String, Ops> lookupMap = Maps.newHashMap();
 

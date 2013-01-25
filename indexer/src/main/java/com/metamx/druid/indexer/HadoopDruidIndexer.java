@@ -20,23 +20,18 @@
 package com.metamx.druid.indexer;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Lists;
 import com.metamx.common.Pair;
+import com.metamx.common.lifecycle.Lifecycle;
 import com.metamx.druid.jackson.DefaultObjectMapper;
 import org.codehaus.jackson.map.ObjectMapper;
-import org.joda.time.DateTime;
-import org.joda.time.Interval;
 
-import java.io.File;
-import java.util.Arrays;
 import java.util.List;
 
 /**
  */
+@Deprecated
 public class HadoopDruidIndexer
 {
-  private static final ObjectMapper jsonMapper = new DefaultObjectMapper();
-
   public static void main(String[] args) throws Exception
   {
     if (args.length < 1 || args.length > 2) {
@@ -44,40 +39,25 @@ public class HadoopDruidIndexer
       System.exit(2);
     }
 
-    final List<Interval> dataInterval;
-    final HadoopDruidIndexerConfig config;
-    HadoopDruidIndexerJob job;
+    HadoopDruidIndexerNode node = HadoopDruidIndexerNode.builder().build();
+
+    if (args.length == 2) {
+      node.setIntervalSpec(args[0]);
+    }
+    node.setArgumentSpec(args[args.length == 1 ? 0 : 1]);
+
+    Lifecycle lifecycle = new Lifecycle();
+    lifecycle.addManagedInstance(node);
+
     try {
-      final String intervalSpec = args.length == 1 ? null : args[0];
-      final String argumentSpec = args[args.length == 1 ? 0 : 1];
-
-      if (argumentSpec.startsWith("{")) {
-        config = jsonMapper.readValue(argumentSpec, HadoopDruidIndexerConfig.class);
-      } else {
-        config = jsonMapper.readValue(new File(argumentSpec), HadoopDruidIndexerConfig.class);
-      }
-
-      if(intervalSpec != null) {
-        dataInterval = Lists.transform(
-            Arrays.asList(intervalSpec.split(",")),
-            new StringIntervalFunction()
-        );
-
-        config.setIntervals(dataInterval);
-      }
-      config.setVersion(new DateTime());
-
-      job = new HadoopDruidIndexerJob(config);
+      lifecycle.start();
     }
     catch (Exception e) {
       e.printStackTrace();
       Thread.sleep(500);
       printHelp();
       System.exit(1);
-      return;
     }
-
-    job.run();
   }
 
   private static final List<Pair<String, String>> expectedFields =
@@ -88,14 +68,23 @@ public class HadoopDruidIndexer
                    .add(
                        Pair.of(
                            "dataSpec",
-                           "A JSON object with fields " +
-                           "format=(json, csv, tsv), " +
-                           "columns=JSON array of column names for the delimited text input file (only for csv and tsv formats)," +
-                           "dimensions=JSON array of dimensionn names (must match names in columns)," +
+                           "A JSON object with fields "
+                           +
+                           "format=(json, csv, tsv), "
+                           +
+                           "columns=JSON array of column names for the delimited text input file (only for csv and tsv formats),"
+                           +
+                           "dimensions=JSON array of dimensionn names (must match names in columns),"
+                           +
                            "delimiter=delimiter of the data (only for tsv format)"
                        )
                    )
-                   .add(Pair.of("segmentGranularity", "Granularity that segments should be created at."))
+                   .add(
+                       Pair.of(
+                           "granularitySpec",
+                           "A JSON object indicating the Granularity that segments should be created at."
+                       )
+                   )
                    .add(
                        Pair.of(
                            "pathSpec",
@@ -129,8 +118,7 @@ public class HadoopDruidIndexer
 
   private static void printHelp()
   {
-    System.out.println("Usage: <java invocation> <time_interval> <config_spec>");
-    System.out.println("<time_interval> is the ISO8601 interval of data to run over.");
+    System.out.println("Usage: <java invocation> <config_spec>");
     System.out.println("<config_spec> is either a JSON object or the path to a file that contains a JSON object.");
     System.out.println();
     System.out.println("JSON object description:");

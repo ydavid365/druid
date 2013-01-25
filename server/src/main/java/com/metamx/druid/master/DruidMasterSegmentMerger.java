@@ -77,8 +77,8 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
   @Override
   public DruidMasterRuntimeParams run(DruidMasterRuntimeParams params)
   {
+    MasterStats stats = new MasterStats();
     Map<String, VersionedIntervalTimeline<String, DataSegment>> dataSources = Maps.newHashMap();
-    int count = 0;
 
     // Find serviced segments by using a timeline
     for (DataSegment dataSegment : params.getAvailableSegments()) {
@@ -101,21 +101,23 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
       List<TimelineObjectHolder<String, DataSegment>> timelineObjects =
           timeline.lookup(new Interval(new DateTime(0), new DateTime("3000-01-01")));
 
-      // Accumulate timelineObjects greedily until we surpass our size threshold, then backtrack to the maximum complete set
+      // Accumulate timelineObjects greedily until we reach our limits, then backtrack to the maximum complete set
       SegmentsToMerge segmentsToMerge = new SegmentsToMerge();
 
       for(int i = 0 ; i < timelineObjects.size() ; i++) {
 
         segmentsToMerge.add(timelineObjects.get(i));
 
-        if(segmentsToMerge.getMergedSize() > params.getMergeThreshold()) {
-          i -= segmentsToMerge.backtrack(params.getMergeThreshold());
+        if (segmentsToMerge.getByteCount() > params.getMergeBytesLimit()
+            || segmentsToMerge.getSegmentCount() >= params.getMergeSegmentsLimit())
+        {
+          i -= segmentsToMerge.backtrack(params.getMergeBytesLimit());
 
-          if(segmentsToMerge.size() > 1) {
-            count += mergeSegments(segmentsToMerge, entry.getKey());
+          if (segmentsToMerge.getSegmentCount() > 1) {
+            stats.addToGlobalStat("mergedCount", mergeSegments(segmentsToMerge, entry.getKey()));
           }
 
-          if(segmentsToMerge.size() == 0) {
+          if (segmentsToMerge.getSegmentCount() == 0) {
             // Backtracked all the way to zero. Increment by one so we continue to make progress.
             i++;
           }
@@ -125,14 +127,14 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
       }
 
       // Finish any timelineObjects to merge that may have not hit threshold
-      segmentsToMerge.backtrack(params.getMergeThreshold());
-      if (segmentsToMerge.size() > 1) {
-        count += mergeSegments(segmentsToMerge, entry.getKey());
+      segmentsToMerge.backtrack(params.getMergeBytesLimit());
+      if (segmentsToMerge.getSegmentCount() > 1) {
+        stats.addToGlobalStat("mergedCount", mergeSegments(segmentsToMerge, entry.getKey()));
       }
     }
 
     return params.buildFromExisting()
-                 .withMergedSegmentCount(count)
+                 .withMasterStats(stats)
                  .build();
   }
 
@@ -180,13 +182,13 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
     // (timeline object, union interval of underlying segments up to this point in the list)
     private final List<Pair<TimelineObjectHolder<String, DataSegment>, Interval>> timelineObjects;
 
-    private long mergedSize;
+    private long byteCount;
 
     private SegmentsToMerge()
     {
       this.timelineObjects = Lists.newArrayList();
       this.segments = HashMultiset.create();
-      this.mergedSize = 0;
+      this.byteCount = 0;
     }
 
     public List<DataSegment> getSegments()
@@ -231,7 +233,7 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
       for(final PartitionChunk<DataSegment> segment : timelineObject.getObject()) {
         segments.add(segment.getObject());
         if(segments.count(segment.getObject()) == 1) {
-          mergedSize += segment.getObject().getSize();
+          byteCount += segment.getObject().getSize();
         }
       }
 
@@ -273,12 +275,12 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
       }
     }
 
-    public long getMergedSize()
+    public long getByteCount()
     {
-      return mergedSize;
+      return byteCount;
     }
 
-    public int size()
+    public int getSegmentCount()
     {
       return timelineObjects.size();
     }
@@ -301,14 +303,14 @@ public class DruidMasterSegmentMerger implements DruidMasterHelper
       Preconditions.checkArgument(maxSize >= 0, "maxSize >= 0");
 
       int removed = 0;
-      while (!isComplete() || mergedSize > maxSize) {
+      while (!isComplete() || byteCount > maxSize) {
         removed ++;
 
         final TimelineObjectHolder<String, DataSegment> removedHolder = timelineObjects.remove(timelineObjects.size() - 1).lhs;
         for(final PartitionChunk<DataSegment> segment : removedHolder.getObject()) {
           segments.remove(segment.getObject());
           if(segments.count(segment.getObject()) == 0) {
-            mergedSize -= segment.getObject().getSize();
+            byteCount -= segment.getObject().getSize();
           }
         }
       }

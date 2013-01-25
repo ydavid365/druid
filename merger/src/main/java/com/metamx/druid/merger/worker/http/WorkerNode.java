@@ -28,7 +28,9 @@ import com.metamx.common.lifecycle.Lifecycle;
 import com.metamx.common.lifecycle.LifecycleStart;
 import com.metamx.common.lifecycle.LifecycleStop;
 import com.metamx.common.logger.Logger;
+import com.metamx.druid.RegisteringNode;
 import com.metamx.druid.http.StatusServlet;
+import com.metamx.druid.initialization.CuratorConfig;
 import com.metamx.druid.initialization.Initialization;
 import com.metamx.druid.initialization.ServerConfig;
 import com.metamx.druid.jackson.DefaultObjectMapper;
@@ -40,9 +42,9 @@ import com.metamx.druid.merger.worker.TaskMonitor;
 import com.metamx.druid.merger.worker.Worker;
 import com.metamx.druid.merger.worker.WorkerCuratorCoordinator;
 import com.metamx.druid.merger.worker.config.WorkerConfig;
-import com.metamx.druid.realtime.S3SegmentPusher;
-import com.metamx.druid.realtime.S3SegmentPusherConfig;
-import com.metamx.druid.realtime.SegmentPusher;
+import com.metamx.druid.loading.S3SegmentPusher;
+import com.metamx.druid.loading.S3SegmentPusherConfig;
+import com.metamx.druid.loading.SegmentPusher;
 import com.metamx.druid.utils.PropUtils;
 import com.metamx.emitter.EmittingLogger;
 import com.metamx.emitter.core.Emitters;
@@ -69,6 +71,7 @@ import org.mortbay.jetty.servlet.ServletHolder;
 import org.skife.config.ConfigurationObjectFactory;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ExecutorService;
@@ -77,7 +80,7 @@ import java.util.concurrent.ScheduledExecutorService;
 
 /**
  */
-public class WorkerNode
+public class WorkerNode extends RegisteringNode
 {
   private static final Logger log = new Logger(WorkerNode.class);
 
@@ -110,6 +113,8 @@ public class WorkerNode
       ConfigurationObjectFactory configFactory
   )
   {
+    super(Arrays.asList(jsonMapper));
+
     this.jsonMapper = jsonMapper;
     this.lifecycle = lifecycle;
     this.props = props;
@@ -279,8 +284,8 @@ public class WorkerNode
     if (taskToolbox == null) {
       final RestS3Service s3Client = new RestS3Service(
           new AWSCredentials(
-              props.getProperty("com.metamx.aws.accessKey"),
-              props.getProperty("com.metamx.aws.secretKey")
+              PropUtils.getProperty(props, "com.metamx.aws.accessKey"),
+              PropUtils.getProperty(props, "com.metamx.aws.secretKey")
           )
       );
       final SegmentPusher segmentPusher = new S3SegmentPusher(
@@ -294,8 +299,9 @@ public class WorkerNode
 
   public void initializeCuratorFramework() throws IOException
   {
+    final CuratorConfig curatorConfig = configFactory.build(CuratorConfig.class);
     curatorFramework = Initialization.makeCuratorFrameworkClient(
-        props.getProperty("druid.zk.service.host"),
+        curatorConfig,
         lifecycle
     );
   }
@@ -325,7 +331,6 @@ public class WorkerNode
       taskMonitor = new TaskMonitor(
           pathChildrenCache,
           curatorFramework,
-          jsonMapper,
           workerCuratorCoordinator,
           taskToolbox,
           workerExec
