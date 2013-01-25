@@ -31,7 +31,9 @@ import com.metamx.druid.client.DruidDataSource;
 import com.metamx.druid.client.DruidServer;
 import com.metamx.druid.client.ServerInventoryManager;
 import com.metamx.druid.coordination.DruidClusterInfo;
+import com.metamx.druid.db.DatabaseRuleManager;
 import com.metamx.druid.db.DatabaseSegmentManager;
+import com.metamx.druid.master.rules.Rule;
 
 import javax.annotation.Nullable;
 import javax.inject.Inject;
@@ -44,6 +46,7 @@ import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Response;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -57,17 +60,20 @@ public class InfoResource
 {
   private final ServerInventoryManager serverInventoryManager;
   private final DatabaseSegmentManager databaseSegmentManager;
+  private final DatabaseRuleManager databaseRuleManager;
   private final DruidClusterInfo druidClusterInfo;
 
   @Inject
   public InfoResource(
       ServerInventoryManager serverInventoryManager,
       DatabaseSegmentManager databaseSegmentManager,
+      DatabaseRuleManager databaseRuleManager,
       DruidClusterInfo druidClusterInfo
   )
   {
     this.serverInventoryManager = serverInventoryManager;
     this.databaseSegmentManager = databaseSegmentManager;
+    this.databaseRuleManager = databaseRuleManager;
     this.druidClusterInfo = druidClusterInfo;
   }
 
@@ -259,6 +265,56 @@ public class InfoResource
     }
 
     return Response.status(Response.Status.NOT_FOUND).build();
+  }
+
+  @GET
+  @Path("/tiers")
+  @Produces("application/json")
+  public Response getTiers()
+  {
+    Set<String> tiers = Sets.newHashSet();
+    for (DruidServer server : serverInventoryManager.getInventory()) {
+      tiers.add(server.getTier());
+    }
+    return Response.status(Response.Status.OK)
+                   .entity(tiers)
+                   .build();
+  }
+
+  @GET
+  @Path("/rules")
+  @Produces("application/json")
+  public Response getRules()
+  {
+    return Response.status(Response.Status.OK)
+                   .entity(databaseRuleManager.getAllRules())
+                   .build();
+  }
+
+  @GET
+  @Path("/rules/{dataSourceName}")
+  @Produces("application/json")
+  public Response getDatasourceRules(
+      @PathParam("dataSourceName") final String dataSourceName
+  )
+  {
+    return Response.status(Response.Status.OK)
+                   .entity(databaseRuleManager.getRules(dataSourceName))
+                   .build();
+  }
+
+  @POST
+  @Path("/rules/{dataSourceName}")
+  @Consumes("application/json")
+  public Response setDatasourceRules(
+      @PathParam("dataSourceName") final String dataSourceName,
+      final List<Rule> rules
+  )
+  {
+    if (databaseRuleManager.overrideRule(dataSourceName, rules)) {
+      return Response.status(Response.Status.OK).build();
+    }
+    return Response.status(Response.Status.INTERNAL_SERVER_ERROR).build();
   }
 
   @GET
@@ -486,5 +542,105 @@ public class InfoResource
         )
     );
     return dataSources;
+  }
+
+  @GET
+  @Path("/db/datasources")
+  @Produces("application/json")
+  public Response getDatabaseDataSources(
+      @QueryParam("full") String full
+  )
+  {
+    Response.ResponseBuilder builder = Response.status(Response.Status.OK);
+    if (full != null) {
+      return builder.entity(databaseSegmentManager.getInventory()).build();
+    }
+
+    List<String> dataSourceNames = Lists.newArrayList(
+        Iterables.transform(
+            databaseSegmentManager.getInventory(),
+            new Function<DruidDataSource, String>()
+            {
+              @Override
+              public String apply(@Nullable DruidDataSource dataSource)
+              {
+                return dataSource.getName();
+              }
+            }
+        )
+    );
+
+    Collections.sort(dataSourceNames);
+
+    return builder.entity(dataSourceNames).build();
+  }
+
+  @GET
+  @Path("/db/datasources/{dataSourceName}")
+  @Produces("application/json")
+  public Response getDatabaseSegmentDataSource(
+      @PathParam("dataSourceName") final String dataSourceName
+  )
+  {
+    DruidDataSource dataSource = databaseSegmentManager.getInventoryValue(dataSourceName);
+    if (dataSource == null) {
+      return Response.status(Response.Status.NOT_FOUND).build();
+    }
+
+    return Response.status(Response.Status.OK).entity(dataSource).build();
+  }
+
+  @GET
+  @Path("/db/datasources/{dataSourceName}/segments")
+  @Produces("application/json")
+  public Response getDatabaseSegmentDataSourceSegments(
+      @PathParam("dataSourceName") String dataSourceName,
+      @QueryParam("full") String full
+  )
+  {
+    DruidDataSource dataSource = databaseSegmentManager.getInventoryValue(dataSourceName);
+    if (dataSource == null) {
+      return Response.status(Response.Status.NOT_FOUND).build();
+    }
+
+    Response.ResponseBuilder builder = Response.status(Response.Status.OK);
+    if (full != null) {
+      return builder.entity(dataSource.getSegments()).build();
+    }
+
+    return builder.entity(
+        Iterables.transform(
+            dataSource.getSegments(),
+            new Function<DataSegment, Object>()
+            {
+              @Override
+              public Object apply(@Nullable DataSegment segment)
+              {
+                return segment.getIdentifier();
+              }
+            }
+        )
+    ).build();
+  }
+
+  @GET
+  @Path("/db/datasources/{dataSourceName}/segments/{segmentId}")
+  @Produces("application/json")
+  public Response getDatabaseSegmentDataSourceSegment(
+      @PathParam("dataSourceName") String dataSourceName,
+      @PathParam("segmentId") String segmentId
+  )
+  {
+    DruidDataSource dataSource = databaseSegmentManager.getInventoryValue(dataSourceName);
+    if (dataSource == null) {
+      return Response.status(Response.Status.NOT_FOUND).build();
+    }
+
+    for (DataSegment segment : dataSource.getSegments()) {
+      if (segment.getIdentifier().equalsIgnoreCase(segmentId)) {
+        return Response.status(Response.Status.OK).entity(segment).build();
+      }
+    }
+    return Response.status(Response.Status.NOT_FOUND).build();
   }
 }

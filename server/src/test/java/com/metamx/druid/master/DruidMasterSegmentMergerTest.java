@@ -32,7 +32,8 @@ import java.util.List;
 
 public class DruidMasterSegmentMergerTest
 {
-  private static final long mergeThreshold = 100;
+  private static final long mergeBytesLimit = 100;
+  private static final int mergeSegmentsLimit = 8;
 
   @Test
   public void testNoMerges()
@@ -101,7 +102,23 @@ public class DruidMasterSegmentMergerTest
   }
 
   @Test
-  public void testMergeSeries()
+  public void testMergeNoncontiguous()
+  {
+    final List<DataSegment> segments = ImmutableList.of(
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P1D")).version("2").size(10).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-03/P1D")).version("2").size(10).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-04/P1D")).version("2").size(10).build()
+    );
+
+    Assert.assertEquals(
+        ImmutableList.of(
+            ImmutableList.of(segments.get(0), segments.get(1), segments.get(2))
+        ), merge(segments)
+    );
+  }
+
+  @Test
+  public void testMergeSeriesByteLimited()
   {
     final List<DataSegment> segments = ImmutableList.of(
         DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P1D")).version("2").size(40).build(),
@@ -117,6 +134,39 @@ public class DruidMasterSegmentMergerTest
             ImmutableList.of(segments.get(0), segments.get(1)),
             ImmutableList.of(segments.get(2), segments.get(3)),
             ImmutableList.of(segments.get(4), segments.get(5))
+        ), merge(segments)
+    );
+  }
+
+  @Test
+  public void testMergeSeriesSegmentLimited()
+  {
+    final List<DataSegment> segments = ImmutableList.of(
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-02/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-03/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-04/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-05/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-06/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-07/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-08/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-09/P1D")).version("2").size(1).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-10/P1D")).version("2").size(1).build()
+    );
+
+    Assert.assertEquals(
+        ImmutableList.of(
+            ImmutableList.of(
+                segments.get(0),
+                segments.get(1),
+                segments.get(2),
+                segments.get(3),
+                segments.get(4),
+                segments.get(5),
+                segments.get(6),
+                segments.get(7)
+            ),
+            ImmutableList.of(segments.get(8), segments.get(9))
         ), merge(segments)
     );
   }
@@ -139,6 +189,40 @@ public class DruidMasterSegmentMergerTest
             ImmutableList.of(segments.get(0), segments.get(1)),
             ImmutableList.of(segments.get(2), segments.get(3), segments.get(4), segments.get(5), segments.get(6))
             ), merge(segments)
+    );
+  }
+
+  @Test
+  public void testOverlappingMergeWithGapsAlignedStart()
+  {
+    final List<DataSegment> segments = ImmutableList.of(
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P8D")).version("2").size(80).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P1D")).version("3").size(8).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-04/P1D")).version("3").size(8).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-09/P1D")).version("3").size(8).build()
+    );
+
+    Assert.assertEquals(
+        ImmutableList.of(
+            ImmutableList.of(segments.get(1), segments.get(0), segments.get(2))
+        ), merge(segments)
+    );
+  }
+
+  @Test
+  public void testOverlappingMergeWithGapsNonalignedStart()
+  {
+    final List<DataSegment> segments = ImmutableList.of(
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-01/P8D")).version("2").size(80).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-02/P1D")).version("3").size(8).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-04/P1D")).version("3").size(8).build(),
+        DataSegment.builder().dataSource("foo").interval(new Interval("2012-01-09/P1D")).version("3").size(8).build()
+    );
+
+    Assert.assertEquals(
+        ImmutableList.of(
+            ImmutableList.of(segments.get(0), segments.get(1), segments.get(2))
+        ), merge(segments)
     );
   }
 
@@ -308,7 +392,8 @@ public class DruidMasterSegmentMergerTest
     final DruidMasterSegmentMerger merger = new DruidMasterSegmentMerger(mergerClient);
     final DruidMasterRuntimeParams params = DruidMasterRuntimeParams.newBuilder()
                                                                     .withAvailableSegments(ImmutableSet.copyOf(segments))
-                                                                    .withMergeThreshold(mergeThreshold)
+                                                                    .withMergeBytesLimit(mergeBytesLimit)
+                                                                    .withMergeSegmentsLimit(mergeSegmentsLimit)
                                                                     .build();
 
     merger.run(params);

@@ -19,11 +19,13 @@
 
 package com.metamx.druid.aggregation.post;
 
+import com.google.common.collect.Sets;
 import org.codehaus.jackson.annotate.JsonCreator;
 import org.codehaus.jackson.annotate.JsonProperty;
 
 import java.util.Comparator;
 import java.util.Map;
+import java.util.Set;
 
 /**
  */
@@ -40,6 +42,12 @@ public class ConstantPostAggregator implements PostAggregator
   {
     this.name = name;
     this.constantValue = constantValue;
+  }
+
+  @Override
+  public Set<String> getDependentFields()
+  {
+    return Sets.newHashSet();
   }
 
   @Override

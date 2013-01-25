@@ -25,7 +25,6 @@ import com.metamx.druid.client.DataSegment;
 import com.metamx.druid.client.DruidServer;
 import com.metamx.druid.client.ServerInventoryManager;
 import com.metamx.druid.client.ZKPhoneBook;
-import com.metamx.druid.coordination.legacy.TheSizeAdjuster;
 import com.metamx.druid.db.DatabaseSegmentManager;
 import com.metamx.druid.metrics.NoopServiceEmitter;
 import com.metamx.phonebook.PhoneBook;
@@ -41,13 +40,10 @@ import java.util.Map;
  */
 public class DruidMasterTest
 {
-  private static final Logger log = new Logger(DruidMasterTest.class);
-
   private DruidMaster master;
   private PhoneBook yp;
   private DatabaseSegmentManager databaseSegmentManager;
   private ServerInventoryManager serverInventoryManager;
-  private TheSizeAdjuster theSizeAdjuster;
   private ScheduledExecutorFactory scheduledExecutorFactory;
   private DruidServer druidServer;
   private DataSegment segment;
@@ -68,9 +64,6 @@ public class DruidMasterTest
 
     databaseSegmentManager = EasyMock.createNiceMock(DatabaseSegmentManager.class);
     EasyMock.replay(databaseSegmentManager);
-
-    theSizeAdjuster = EasyMock.createNiceMock(TheSizeAdjuster.class);
-    EasyMock.replay(theSizeAdjuster);
 
     scheduledExecutorFactory = EasyMock.createNiceMock(ScheduledExecutorFactory.class);
     EasyMock.replay(scheduledExecutorFactory);
@@ -131,19 +124,12 @@ public class DruidMasterTest
           {
             return "";
           }
-
-          @Override
-          public long getMergeThreshold()
-          {
-            return super.getMergeThreshold();
-          }
         },
-        null,
         null,
         null,
         databaseSegmentManager,
         serverInventoryManager,
-        theSizeAdjuster,
+        null,
         yp,
         new NoopServiceEmitter(),
         scheduledExecutorFactory,

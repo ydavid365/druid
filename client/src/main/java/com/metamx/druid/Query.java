@@ -21,10 +21,12 @@ package com.metamx.druid;
 
 import com.metamx.common.guava.Sequence;
 import com.metamx.druid.query.group.GroupByQuery;
+import com.metamx.druid.query.metadata.SegmentMetadataQuery;
 import com.metamx.druid.query.search.SearchQuery;
 import com.metamx.druid.query.segment.QuerySegmentSpec;
 import com.metamx.druid.query.segment.QuerySegmentWalker;
 import com.metamx.druid.query.timeboundary.TimeBoundaryQuery;
+import com.metamx.druid.query.timeseries.TimeseriesQuery;
 import org.codehaus.jackson.annotate.JsonSubTypes;
 import org.codehaus.jackson.annotate.JsonTypeInfo;
 import org.joda.time.Duration;
@@ -35,12 +37,15 @@ import java.util.Map;
 
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "queryType")
 @JsonSubTypes(value = {
+    @JsonSubTypes.Type(name = Query.TIMESERIES, value = TimeseriesQuery.class),
     @JsonSubTypes.Type(name = Query.SEARCH, value = SearchQuery.class),
     @JsonSubTypes.Type(name = Query.TIME_BOUNDARY, value = TimeBoundaryQuery.class),
-    @JsonSubTypes.Type(name = "groupBy", value= GroupByQuery.class)
+    @JsonSubTypes.Type(name = "groupBy", value= GroupByQuery.class),
+    @JsonSubTypes.Type(name = "segmentMetadata", value= SegmentMetadataQuery.class)
 })
 public interface Query<T>
 {
+  public static final String TIMESERIES = "timeseries";
   public static final String SEARCH = "search";
   public static final String TIME_BOUNDARY = "timeBoundary";
 

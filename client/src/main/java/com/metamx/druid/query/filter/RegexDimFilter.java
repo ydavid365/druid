@@ -29,7 +29,6 @@ import java.nio.ByteBuffer;
  */
 public class RegexDimFilter implements DimFilter
 {
-  private static final byte CACHE_ID_KEY = 0x5;
   private final String dimension;
   private final String pattern;
 
@@ -62,7 +61,7 @@ public class RegexDimFilter implements DimFilter
     final byte[] patternBytes = pattern.getBytes(Charsets.UTF_8);
 
     return ByteBuffer.allocate(1 + dimensionBytes.length + patternBytes.length)
-        .put(CACHE_ID_KEY)
+        .put(DimFilterCacheHelper.REGEX_CACHE_ID)
         .put(dimensionBytes)
         .put(patternBytes)
         .array();

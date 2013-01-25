@@ -19,34 +19,25 @@
 
 package com.metamx.druid.indexer;
 
-import com.google.common.base.Function;
 import com.google.common.base.Optional;
-import com.google.common.base.Predicate;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.google.common.hash.Hashing;
 import com.google.common.io.Closeables;
 import com.google.common.primitives.Longs;
 import com.metamx.common.ISE;
-import com.metamx.common.RE;
-import com.metamx.common.guava.FunctionalIterable;
 import com.metamx.common.logger.Logger;
-import com.metamx.common.parsers.Parser;
-import com.metamx.common.parsers.ParserUtils;
 import com.metamx.druid.aggregation.AggregatorFactory;
 import com.metamx.druid.client.DataSegment;
+import com.metamx.druid.index.QueryableIndex;
 import com.metamx.druid.index.v1.IncrementalIndex;
 import com.metamx.druid.index.v1.IndexIO;
 import com.metamx.druid.index.v1.IndexMerger;
-import com.metamx.druid.index.v1.MMappedIndex;
-import com.metamx.druid.index.v1.serde.ComplexMetrics;
-import com.metamx.druid.input.MapBasedInputRow;
+import com.metamx.druid.indexer.data.StringInputRowParser;
 import com.metamx.druid.indexer.rollup.DataRollupSpec;
-import com.metamx.druid.jackson.DefaultObjectMapper;
+import com.metamx.druid.input.InputRow;
 import org.apache.commons.io.FileUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -56,13 +47,11 @@ import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3native.NativeS3FileSystem;
 import org.apache.hadoop.io.BytesWritable;
-import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapred.InvalidJobConfException;
 import org.apache.hadoop.mapreduce.Counter;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.JobContext;
-import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Partitioner;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
@@ -71,7 +60,6 @@ import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
 
-import javax.annotation.Nullable;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -81,7 +69,6 @@ import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -130,7 +117,7 @@ public class IndexGeneratorJob implements Jobby
       job.setMapperClass(IndexGeneratorMapper.class);
       job.setMapOutputValueClass(Text.class);
 
-      SortableBytes.useSortableBytesAsKey(job);
+      SortableBytes.useSortableBytesAsMapOutputKey(job);
 
       job.setNumReduceTasks(Iterables.size(config.getAllBuckets()));
       job.setPartitionerClass(IndexGeneratorPartitioner.class);
@@ -147,11 +134,12 @@ public class IndexGeneratorJob implements Jobby
       job.setJarByClass(IndexGeneratorJob.class);
 
       job.submit();
-      log.info("Job submitted, status available at %s", job.getTrackingURL());
+      log.info("Job %s submitted, status available at %s", job.getJobName(), job.getTrackingURL());
 
       boolean success = job.waitForCompletion(true);
 
-      Counter invalidRowCount = job.getCounters().findCounter(HadoopDruidIndexerConfig.IndexJobCounters.INVALID_ROW_COUNTER);
+      Counter invalidRowCount = job.getCounters()
+                                   .findCounter(HadoopDruidIndexerConfig.IndexJobCounters.INVALID_ROW_COUNTER);
       jobStats.setInvalidRowCount(invalidRowCount.getValue());
 
       return success;
@@ -161,76 +149,29 @@ public class IndexGeneratorJob implements Jobby
     }
   }
 
-  public static class IndexGeneratorMapper extends Mapper<LongWritable, Text, BytesWritable, Text>
+  public static class IndexGeneratorMapper extends HadoopDruidIndexerMapper<BytesWritable, Text>
   {
-    private HadoopDruidIndexerConfig config;
-    private Parser<String, Object> parser;
-    private Function<String, DateTime> timestampConverter;
-
     @Override
-    protected void setup(Context context)
-        throws IOException, InterruptedException
-    {
-      config = HadoopDruidIndexerConfig.fromConfiguration(context.getConfiguration());
-      parser = config.getDataSpec().getParser();
-      timestampConverter = ParserUtils.createTimestampParser(config.getTimestampFormat());
-    }
-
-    @Override
-    protected void map(
-        LongWritable key, Text value, Context context
+    protected void innerMap(
+        InputRow inputRow,
+        Text text,
+        Context context
     ) throws IOException, InterruptedException
     {
+      // Group by bucket, sort by timestamp
+      final Optional<Bucket> bucket = getConfig().getBucket(inputRow);
 
-      try {
-        final Map<String, Object> values = parser.parse(value.toString());
-
-        final String tsStr = (String) values.get(config.getTimestampColumnName());
-        final DateTime timestamp;
-        try {
-          timestamp = timestampConverter.apply(tsStr);
-        }
-        catch(IllegalArgumentException e) {
-          if(config.isIgnoreInvalidRows()) {
-            context.getCounter(HadoopDruidIndexerConfig.IndexJobCounters.INVALID_ROW_COUNTER).increment(1);
-            return; // we're ignoring this invalid row
-          }
-          else {
-            throw e;
-          }
-        }
-
-        Optional<Bucket> bucket = config.getBucket(
-            Maps.transformEntries(
-                values,
-                new Maps.EntryTransformer<String, Object, String>()
-                {
-                  @Override
-                  public String transformEntry(@Nullable String key, @Nullable Object value)
-                  {
-                    if (key.equalsIgnoreCase(config.getTimestampColumnName())) {
-                      return timestamp.toString();
-                    }
-                    return value.toString();
-                  }
-                }
-            )
-        );
-
-        if (bucket.isPresent()) {
-          // Group by bucket, sort by timestamp
-          context.write(
-              new SortableBytes(
-                  bucket.get().toGroupKey(),
-                  Longs.toByteArray(timestamp.getMillis())
-              ).toBytesWritable(),
-              value
-          );
-        }
+      if(!bucket.isPresent()) {
+        throw new ISE("WTF?! No bucket found for row: %s", inputRow);
       }
-      catch (RuntimeException e) {
-        throw new RE(e, "Failure on row[%s]", value);
-      }
+
+      context.write(
+          new SortableBytes(
+              bucket.get().toGroupKey(),
+              Longs.toByteArray(inputRow.getTimestampFromEpoch())
+          ).toBytesWritable(),
+          text
+      );
     }
   }
 
@@ -255,10 +196,8 @@ public class IndexGeneratorJob implements Jobby
   public static class IndexGeneratorReducer extends Reducer<BytesWritable, Text, BytesWritable, Text>
   {
     private HadoopDruidIndexerConfig config;
-    private final DefaultObjectMapper jsonMapper = new DefaultObjectMapper();
     private List<String> metricNames = Lists.newArrayList();
-    private Function<String, DateTime> timestampConverter;
-    private Parser parser;
+    private StringInputRowParser parser;
 
     @Override
     protected void setup(Context context)
@@ -269,8 +208,8 @@ public class IndexGeneratorJob implements Jobby
       for (AggregatorFactory factory : config.getRollupSpec().getAggs()) {
         metricNames.add(factory.getName().toLowerCase());
       }
-      timestampConverter = ParserUtils.createTimestampParser(config.getTimestampFormat());
-      parser = config.getDataSpec().getParser();
+
+      parser = config.getParser();
     }
 
     @Override
@@ -303,32 +242,10 @@ public class IndexGeneratorJob implements Jobby
 
       for (final Text value : values) {
         context.progress();
-        Map<String, Object> event = parser.parse(value.toString());
-        final long timestamp = timestampConverter.apply((String) event.get(config.getTimestampColumnName()))
-                                                 .getMillis();
-        List<String> dimensionNames =
-            config.getDataSpec().hasCustomDimensions() ?
-            config.getDataSpec().getDimensions() :
-            Lists.newArrayList(
-                FunctionalIterable.create(event.keySet())
-                                  .filter(
-                                      new Predicate<String>()
-                                      {
-                                        @Override
-                                        public boolean apply(@Nullable String input)
-                                        {
-                                          return !(metricNames.contains(input.toLowerCase())
-                                                   || config.getTimestampColumnName()
-                                                            .equalsIgnoreCase(input));
-                                        }
-                                      }
-                                  )
-            );
-        allDimensionNames.addAll(dimensionNames);
+        final InputRow inputRow = parser.parse(value.toString());
+        allDimensionNames.addAll(inputRow.getDimensions());
 
-        int numRows = index.add(
-            new MapBasedInputRow(timestamp, dimensionNames, event)
-        );
+        int numRows = index.add(inputRow);
         ++lineCount;
 
         if (numRows >= rollupSpec.rowFlushBoundary) {
@@ -363,35 +280,39 @@ public class IndexGeneratorJob implements Jobby
 
       log.info("%,d lines completed.", lineCount);
 
-      List<MMappedIndex> indexes = Lists.newArrayListWithCapacity(indexCount);
+      List<QueryableIndex> indexes = Lists.newArrayListWithCapacity(indexCount);
       final File mergedBase;
 
       if (toMerge.size() == 0) {
         mergedBase = new File(baseFlushFile, "merged");
-        IndexMerger.persist(index, interval, mergedBase, new IndexMerger.ProgressIndicator()
+        IndexMerger.persist(
+            index, interval, mergedBase, new IndexMerger.ProgressIndicator()
         {
           @Override
           public void progress()
           {
             context.progress();
           }
-        });
+        }
+        );
       } else {
         final File finalFile = new File(baseFlushFile, "final");
-        IndexMerger.persist(index, interval, finalFile, new IndexMerger.ProgressIndicator()
+        IndexMerger.persist(
+            index, interval, finalFile, new IndexMerger.ProgressIndicator()
         {
           @Override
           public void progress()
           {
             context.progress();
           }
-        });
+        }
+        );
         toMerge.add(finalFile);
 
         for (File file : toMerge) {
-          indexes.add(IndexIO.mapDir(file));
+          indexes.add(IndexIO.loadIndex(file));
         }
-        mergedBase = IndexMerger.mergeMMapped(
+        mergedBase = IndexMerger.mergeQueryableIndex(
             indexes, aggs, new File(baseFlushFile, "merged"), new IndexMerger.ProgressIndicator()
         {
           @Override
@@ -418,6 +339,7 @@ public class IndexGeneratorJob implements Jobby
       int attemptNumber = context.getTaskAttemptID().getId();
       Path indexBasePath = config.makeSegmentOutputPath(bucket);
       Path indexZipFilePath = new Path(indexBasePath, String.format("index.zip.%s", attemptNumber));
+      final FileSystem infoFS = config.makeDescriptorInfoDir().getFileSystem(context.getConfiguration());
       final FileSystem outputFS = indexBasePath.getFileSystem(context.getConfiguration());
 
       outputFS.mkdirs(indexBasePath);
@@ -477,7 +399,7 @@ public class IndexGeneratorJob implements Jobby
       // retry 1 minute
       boolean success = false;
       for (int i = 0; i < 6; i++) {
-        if (renameIndexFiles(outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
+        if (renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
           log.info("Successfully renamed [%s] to [%s]", indexZipFilePath, finalIndexZipFilePath);
           success = true;
           break;
@@ -507,7 +429,7 @@ public class IndexGeneratorJob implements Jobby
           outputFS.delete(indexZipFilePath, true);
         } else {
           outputFS.delete(finalIndexZipFilePath, true);
-          if (!renameIndexFiles(outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
+          if (!renameIndexFiles(infoFS, outputFS, indexBasePath, indexZipFilePath, finalIndexZipFilePath, segment)) {
             throw new ISE(
                 "Files [%s] and [%s] are different, but still cannot rename after retry loop",
                 indexZipFilePath.toUri().getPath(),
@@ -519,6 +441,7 @@ public class IndexGeneratorJob implements Jobby
     }
 
     private boolean renameIndexFiles(
+        FileSystem intermediateFS,
         FileSystem outputFS,
         Path indexBasePath,
         Path indexZipFilePath,
@@ -536,14 +459,24 @@ public class IndexGeneratorJob implements Jobby
 
         if (zipFile.getModificationTime() >= finalIndexZipFile.getModificationTime()
             || zipFile.getLen() != finalIndexZipFile.getLen()) {
-          log.info("File[%s / %s / %sB] existed, but wasn't the same as [%s / %s / %sB]",
-                   finalIndexZipFile.getPath(), new DateTime(finalIndexZipFile.getModificationTime()), finalIndexZipFile.getLen(),
-                   zipFile.getPath(),           new DateTime(zipFile.getModificationTime()),           zipFile.getLen());
+          log.info(
+              "File[%s / %s / %sB] existed, but wasn't the same as [%s / %s / %sB]",
+              finalIndexZipFile.getPath(),
+              new DateTime(finalIndexZipFile.getModificationTime()),
+              finalIndexZipFile.getLen(),
+              zipFile.getPath(),
+              new DateTime(zipFile.getModificationTime()),
+              zipFile.getLen()
+          );
           outputFS.delete(finalIndexZipFilePath, false);
           needRename = true;
         } else {
-          log.info("File[%s / %s / %sB] existed and will be kept",
-                   finalIndexZipFile.getPath(), new DateTime(finalIndexZipFile.getModificationTime()), finalIndexZipFile.getLen());
+          log.info(
+              "File[%s / %s / %sB] existed and will be kept",
+              finalIndexZipFile.getPath(),
+              new DateTime(finalIndexZipFile.getModificationTime()),
+              finalIndexZipFile.getLen()
+          );
           needRename = false;
         }
       } else {
@@ -554,19 +487,29 @@ public class IndexGeneratorJob implements Jobby
         return false;
       }
 
-      final Path descriptorPath = new Path(indexBasePath, "descriptor.json");
+      writeSegmentDescriptor(outputFS, segment, new Path(indexBasePath, "descriptor.json"));
+      final Path descriptorPath = config.makeDescriptorInfoPath(segment);
+      log.info("Writing descriptor to path[%s]", descriptorPath);
+      intermediateFS.mkdirs(descriptorPath.getParent());
+      writeSegmentDescriptor(intermediateFS, segment, descriptorPath);
+
+      return true;
+    }
+
+    private void writeSegmentDescriptor(FileSystem outputFS, DataSegment segment, Path descriptorPath)
+        throws IOException
+    {
       if (outputFS.exists(descriptorPath)) {
         outputFS.delete(descriptorPath, false);
       }
 
       final FSDataOutputStream descriptorOut = outputFS.create(descriptorPath);
       try {
-        jsonMapper.writeValue(descriptorOut, segment);
+        HadoopDruidIndexerConfig.jsonMapper.writeValue(descriptorOut, segment);
       }
       finally {
         descriptorOut.close();
       }
-      return true;
     }
 
     private long copyFile(
@@ -629,7 +572,8 @@ public class IndexGeneratorJob implements Jobby
     }
   }
 
-  public static class IndexGeneratorStats {
+  public static class IndexGeneratorStats
+  {
     private long invalidRowCount = 0;
 
     public long getInvalidRowCount()

@@ -22,7 +22,6 @@ package com.metamx.druid.http;
 import com.google.common.base.Charsets;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 import com.google.inject.Guice;
 import com.google.inject.Injector;
 import com.google.inject.servlet.GuiceFilter;
@@ -31,16 +30,12 @@ import com.metamx.common.concurrent.ScheduledExecutors;
 import com.metamx.common.config.Config;
 import com.metamx.common.lifecycle.Lifecycle;
 import com.metamx.common.logger.Logger;
-import com.metamx.druid.client.SegmentInventoryManager;
-import com.metamx.druid.client.SegmentInventoryManagerConfig;
 import com.metamx.druid.client.ServerInventoryManager;
 import com.metamx.druid.client.ServerInventoryManagerConfig;
 import com.metamx.druid.coordination.DruidClusterInfo;
 import com.metamx.druid.coordination.DruidClusterInfoConfig;
-import com.metamx.druid.coordination.legacy.S3SizeLookup;
-import com.metamx.druid.coordination.legacy.SizeLookup;
-import com.metamx.druid.coordination.legacy.TheSizeAdjuster;
-import com.metamx.druid.coordination.legacy.TheSizeAdjusterConfig;
+import com.metamx.druid.db.DatabaseRuleManager;
+import com.metamx.druid.db.DatabaseRuleManagerConfig;
 import com.metamx.druid.db.DatabaseSegmentManager;
 import com.metamx.druid.db.DatabaseSegmentManagerConfig;
 import com.metamx.druid.db.DbConnector;
@@ -54,6 +49,8 @@ import com.metamx.druid.log.LogLevelAdjuster;
 import com.metamx.druid.master.DruidMaster;
 import com.metamx.druid.master.DruidMasterConfig;
 import com.metamx.druid.master.LoadQueuePeon;
+import com.metamx.druid.utils.PropUtils;
+import com.metamx.emitter.EmittingLogger;
 import com.metamx.emitter.core.Emitters;
 import com.metamx.emitter.service.ServiceEmitter;
 import com.metamx.http.client.HttpClient;
@@ -71,8 +68,6 @@ import com.netflix.curator.x.discovery.ServiceDiscovery;
 import com.netflix.curator.x.discovery.ServiceProvider;
 import org.I0Itec.zkclient.ZkClient;
 import org.codehaus.jackson.map.ObjectMapper;
-import org.jets3t.service.impl.rest.httpclient.RestS3Service;
-import org.jets3t.service.security.AWSCredentials;
 import org.mortbay.jetty.Server;
 import org.mortbay.jetty.servlet.Context;
 import org.mortbay.jetty.servlet.DefaultServlet;
@@ -106,37 +101,42 @@ public class MasterMain
     );
 
     final ServiceEmitter emitter = new ServiceEmitter(
-        props.getProperty("druid.service"),
-        props.getProperty("druid.host"),
+        PropUtils.getProperty(props, "druid.service"),
+        PropUtils.getProperty(props, "druid.host"),
         Emitters.create(props, httpClient, jsonMapper, lifecycle)
     );
-
-    final RestS3Service s3Client = new RestS3Service(
-        new AWSCredentials(
-            props.getProperty("com.metamx.aws.accessKey"),
-            props.getProperty("com.metamx.aws.secretKey")
-        )
-    );
+    EmittingLogger.registerEmitter(emitter);
 
     final ZkClient zkClient = Initialization.makeZkClient(configFactory.build(ZkClientConfig.class), lifecycle);
 
-    final PhoneBook masterYp = Initialization.createYellowPages(jsonMapper, zkClient, "Master-ZKYP--%s", lifecycle);
+    final PhoneBook masterYp = Initialization.createPhoneBook(jsonMapper, zkClient, "Master-ZKYP--%s", lifecycle);
     final ScheduledExecutorFactory scheduledExecutorFactory = ScheduledExecutors.createFactory(lifecycle);
-
-    final SegmentInventoryManager segmentInventoryManager =
-        new SegmentInventoryManager(configFactory.build(SegmentInventoryManagerConfig.class), masterYp);
 
     final ServerInventoryManager serverInventoryManager =
         new ServerInventoryManager(configFactory.build(ServerInventoryManagerConfig.class), masterYp);
 
     final DbConnectorConfig dbConnectorConfig = configFactory.build(DbConnectorConfig.class);
     final DBI dbi = new DbConnector(dbConnectorConfig).getDBI();
-    DbConnector.createSegmentTable(dbi, dbConnectorConfig);
+    DbConnector.createSegmentTable(dbi, PropUtils.getProperty(props, "druid.database.segmentTable"));
+    DbConnector.createRuleTable(dbi, PropUtils.getProperty(props, "druid.database.ruleTable"));
     final DatabaseSegmentManager databaseSegmentManager = new DatabaseSegmentManager(
         jsonMapper,
         scheduledExecutorFactory.create(1, "DatabaseSegmentManager-Exec--%d"),
         configFactory.build(DatabaseSegmentManagerConfig.class),
         dbi
+    );
+    final DatabaseRuleManagerConfig databaseRuleManagerConfig = configFactory.build(DatabaseRuleManagerConfig.class);
+    final DatabaseRuleManager databaseRuleManager = new DatabaseRuleManager(
+        jsonMapper,
+        scheduledExecutorFactory.create(1, "DatabaseRuleManager-Exec--%d"),
+        databaseRuleManagerConfig,
+        dbi
+    );
+    DatabaseRuleManager.createDefaultRule(
+        dbi,
+        databaseRuleManagerConfig.getRuleTable(),
+        databaseRuleManagerConfig.getDefaultDatasource(),
+        jsonMapper
     );
 
     final ScheduledExecutorService globalScheduledExec = scheduledExecutorFactory.create(1, "Global--%d");
@@ -155,21 +155,24 @@ public class MasterMain
 
     final ServiceDiscoveryConfig serviceDiscoveryConfig = configFactory.build(ServiceDiscoveryConfig.class);
     CuratorFramework curatorFramework = Initialization.makeCuratorFrameworkClient(
-        serviceDiscoveryConfig.getZkHosts(),
+        serviceDiscoveryConfig,
         lifecycle
     );
 
     final ServiceDiscovery serviceDiscovery = Initialization.makeServiceDiscoveryClient(
         curatorFramework,
-        configFactory.build(ServiceDiscoveryConfig.class),
+        serviceDiscoveryConfig,
         lifecycle
     );
 
-    final ServiceProvider serviceProvider = Initialization.makeServiceProvider(
-        druidMasterConfig.getMergerServiceName(),
-        serviceDiscovery,
-        lifecycle
-    );
+    ServiceProvider serviceProvider = null;
+    if (druidMasterConfig.getMergerServiceName() != null) {
+      serviceProvider = Initialization.makeServiceProvider(
+          druidMasterConfig.getMergerServiceName(),
+          serviceDiscovery,
+          lifecycle
+      );
+    }
 
     final DruidClusterInfo druidClusterInfo = new DruidClusterInfo(
         configFactory.build(DruidClusterInfoConfig.class),
@@ -179,18 +182,10 @@ public class MasterMain
     final DruidMaster master = new DruidMaster(
         druidMasterConfig,
         druidClusterInfo,
-        segmentInventoryManager,
         jsonMapper,
         databaseSegmentManager,
         serverInventoryManager,
-        new TheSizeAdjuster(
-            configFactory.build(TheSizeAdjusterConfig.class),
-            jsonMapper,
-            ImmutableMap.<String, SizeLookup>of(
-                "s3", new S3SizeLookup(s3Client)
-            ),
-            zkClient
-        ),
+        databaseRuleManager,
         masterYp,
         emitter,
         scheduledExecutorFactory,
@@ -225,6 +220,7 @@ public class MasterMain
         new MasterServletModule(
             serverInventoryManager,
             databaseSegmentManager,
+            databaseRuleManager,
             druidClusterInfo,
             master,
             jsonMapper
@@ -238,7 +234,7 @@ public class MasterMain
       @Override
       public boolean doLocal()
       {
-        return ((master != null) && master.isClusterMaster());
+        return master.isClusterMaster();
       }
 
       @Override
@@ -258,7 +254,7 @@ public class MasterMain
     final Context staticContext = new Context(server, "/static", Context.SESSIONS);
     staticContext.addServlet(new ServletHolder(new RedirectServlet(redirectInfo)), "/*");
 
-    staticContext.setResourceBase(ServerMain.class.getClassLoader().getResource("static").toExternalForm());
+    staticContext.setResourceBase(ComputeMain.class.getClassLoader().getResource("static").toExternalForm());
 
     final Context root = new Context(server, "/", Context.SESSIONS);
     root.addServlet(new ServletHolder(new StatusServlet()), "/status");
@@ -267,10 +263,6 @@ public class MasterMain
     root.addFilter(
         new FilterHolder(
             new RedirectFilter(
-                HttpClientInit.createClient(
-                    HttpClientConfig.builder().withNumConnections(1).build(),
-                    new Lifecycle()
-                ),
                 new ToStringResponseHandler(Charsets.UTF_8),
                 redirectInfo
             )

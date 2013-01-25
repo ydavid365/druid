@@ -22,12 +22,15 @@ package com.metamx.druid.merger.worker;
 import com.google.common.base.Joiner;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
+import com.metamx.common.ISE;
 import com.metamx.common.lifecycle.LifecycleStart;
 import com.metamx.common.lifecycle.LifecycleStop;
 import com.metamx.common.logger.Logger;
 import com.metamx.druid.merger.common.TaskStatus;
 import com.metamx.druid.merger.common.config.IndexerZkConfig;
 import com.netflix.curator.framework.CuratorFramework;
+import com.netflix.curator.framework.state.ConnectionState;
+import com.netflix.curator.framework.state.ConnectionStateListener;
 import org.apache.zookeeper.CreateMode;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.joda.time.DateTime;
@@ -47,6 +50,7 @@ public class WorkerCuratorCoordinator
   private final ObjectMapper jsonMapper;
   private final CuratorFramework curatorFramework;
   private final Worker worker;
+  private final IndexerZkConfig config;
 
   private final String baseAnnouncementsPath;
   private final String baseTaskPath;
@@ -64,6 +68,7 @@ public class WorkerCuratorCoordinator
     this.jsonMapper = jsonMapper;
     this.curatorFramework = curatorFramework;
     this.worker = worker;
+    this.config = config;
 
     this.baseAnnouncementsPath = getPath(Arrays.asList(config.getAnnouncementPath(), worker.getHost()));
     this.baseTaskPath = getPath(Arrays.asList(config.getTaskPath(), worker.getHost()));
@@ -92,7 +97,29 @@ public class WorkerCuratorCoordinator
       makePathIfNotExisting(
           getAnnouncementsPathForWorker(),
           CreateMode.EPHEMERAL,
-          worker.getStringProps()
+          worker
+      );
+
+      curatorFramework.getConnectionStateListenable().addListener(
+          new ConnectionStateListener()
+          {
+            @Override
+            public void stateChanged(CuratorFramework client, ConnectionState newState)
+            {
+              try {
+                if (newState.equals(ConnectionState.RECONNECTED)) {
+                  makePathIfNotExisting(
+                      getAnnouncementsPathForWorker(),
+                      CreateMode.EPHEMERAL,
+                      worker
+                  );
+                }
+              }
+              catch (Exception e) {
+                throw Throwables.propagate(e);
+              }
+            }
+          }
       );
 
       started = true;
@@ -120,10 +147,14 @@ public class WorkerCuratorCoordinator
   {
     if (curatorFramework.checkExists().forPath(path) == null) {
       try {
+        byte[] rawBytes = jsonMapper.writeValueAsBytes(data);
+        if (rawBytes.length > config.getMaxNumBytes()) {
+          throw new ISE("Length of raw bytes for task too large[%,d > %,d]", rawBytes.length, config.getMaxNumBytes());
+        }
+
         curatorFramework.create()
-                        .creatingParentsIfNeeded()
                         .withMode(mode)
-                        .forPath(path, jsonMapper.writeValueAsBytes(data));
+                        .forPath(path, rawBytes);
       }
       catch (Exception e) {
         log.warn(e, "Could not create path[%s], perhaps it already exists?", path);
@@ -171,6 +202,16 @@ public class WorkerCuratorCoordinator
     }
   }
 
+  public void unannounceTask(String taskId)
+  {
+    try {
+      curatorFramework.delete().guaranteed().forPath(getTaskPathForId(taskId));
+    }
+    catch (Exception e) {
+      log.warn(e, "Could not delete task path for task[%s]", taskId);
+    }
+  }
+
   public void announceStatus(TaskStatus status)
   {
     synchronized (lock) {
@@ -179,12 +220,15 @@ public class WorkerCuratorCoordinator
       }
 
       try {
+        byte[] rawBytes = jsonMapper.writeValueAsBytes(status);
+        if (rawBytes.length > config.getMaxNumBytes()) {
+          throw new ISE("Length of raw bytes for task too large[%,d > %,d]", rawBytes.length, config.getMaxNumBytes());
+        }
+
         curatorFramework.create()
-                        .creatingParentsIfNeeded()
                         .withMode(CreateMode.EPHEMERAL)
                         .forPath(
-                            getStatusPathForId(status.getId()),
-                            jsonMapper.writeValueAsBytes(status)
+                            getStatusPathForId(status.getId()), rawBytes
                         );
       }
       catch (Exception e) {
@@ -205,11 +249,14 @@ public class WorkerCuratorCoordinator
           announceStatus(status);
           return;
         }
+        byte[] rawBytes = jsonMapper.writeValueAsBytes(status);
+        if (rawBytes.length > config.getMaxNumBytes()) {
+          throw new ISE("Length of raw bytes for task too large[%,d > %,d]", rawBytes.length, config.getMaxNumBytes());
+        }
 
         curatorFramework.setData()
                         .forPath(
-                            getStatusPathForId(status.getId()),
-                            jsonMapper.writeValueAsBytes(status)
+                            getStatusPathForId(status.getId()), rawBytes
                         );
       }
       catch (Exception e) {

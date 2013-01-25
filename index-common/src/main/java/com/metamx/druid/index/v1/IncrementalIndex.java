@@ -22,6 +22,7 @@ package com.metamx.druid.index.v1;
 import com.google.common.base.Function;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
@@ -34,6 +35,7 @@ import com.metamx.common.logger.Logger;
 import com.metamx.druid.QueryGranularity;
 import com.metamx.druid.aggregation.Aggregator;
 import com.metamx.druid.aggregation.AggregatorFactory;
+import com.metamx.druid.aggregation.post.PostAggregator;
 import com.metamx.druid.index.v1.serde.ComplexMetricExtractor;
 import com.metamx.druid.index.v1.serde.ComplexMetricSerde;
 import com.metamx.druid.index.v1.serde.ComplexMetrics;
@@ -65,18 +67,19 @@ public class IncrementalIndex implements Iterable<Row>
 
   private final long minTimestamp;
   private final QueryGranularity gran;
-  final AggregatorFactory[] metrics;
+  private final AggregatorFactory[] metrics;
 
   private final Map<String, Integer> metricIndexes;
   private final Map<String, String> metricTypes;
-  final LinkedHashMap<String, Integer> dimensionOrder;
-  final CopyOnWriteArrayList<String> dimensions;
-  final DimensionHolder dimValues;
-  final ConcurrentSkipListMap<TimeAndDims, Aggregator[]> facts;
+  private final ImmutableList<String> metricNames;
+  private final LinkedHashMap<String, Integer> dimensionOrder;
+  private final CopyOnWriteArrayList<String> dimensions;
+  private final DimensionHolder dimValues;
+  private final ConcurrentSkipListMap<TimeAndDims, Aggregator[]> facts;
 
   private volatile int numEntries = 0;
 
-  // This is modified by the same thread.
+  // This is modified on add() by a (hopefully) single thread.
   private InputRow in;
 
   public IncrementalIndex(
@@ -89,12 +92,16 @@ public class IncrementalIndex implements Iterable<Row>
     this.gran = gran;
     this.metrics = metrics;
 
+    final ImmutableList.Builder<String> metricNamesBuilder = ImmutableList.builder();
     final ImmutableMap.Builder<String, Integer> metricIndexesBuilder = ImmutableMap.builder();
     final ImmutableMap.Builder<String, String> metricTypesBuilder = ImmutableMap.builder();
     for (int i = 0; i < metrics.length; i++) {
-      metricIndexesBuilder.put(metrics[i].getName().toLowerCase(), i);
-      metricTypesBuilder.put(metrics[i].getName().toLowerCase(), metrics[i].getTypeName());
+      final String metricName = metrics[i].getName().toLowerCase();
+      metricNamesBuilder.add(metricName);
+      metricIndexesBuilder.put(metricName, i);
+      metricTypesBuilder.put(metricName, metrics[i].getTypeName());
     }
+    metricNames = metricNamesBuilder.build();
     metricIndexes = metricIndexesBuilder.build();
     metricTypes = metricTypesBuilder.build();
 
@@ -109,7 +116,7 @@ public class IncrementalIndex implements Iterable<Row>
    * Adds a new row.  The row might correspond with another row that already exists, in which case this will
    * update that row instead of inserting a new one.
    * <p/>
-   * This is *not* thread-safe.  Calls to add() must be serialized externally
+   * This is *not* thread-safe.  Calls to add() should always happen on the same thread.
    *
    * @param row the row of data to add
    *
@@ -126,6 +133,8 @@ public class IncrementalIndex implements Iterable<Row>
 
     List<String[]> overflow = null;
     for (String dimension : rowDimensions) {
+      dimension = dimension.toLowerCase();
+
       final Integer index = dimensionOrder.get(dimension);
       if (index == null) {
         dimensionOrder.put(dimension, dimensionOrder.size());
@@ -134,9 +143,9 @@ public class IncrementalIndex implements Iterable<Row>
         if (overflow == null) {
           overflow = Lists.newArrayList();
         }
-        overflow.add(getDimVals(row, dimension));
+        overflow.add(getDimVals(dimValues.add(dimension), row.getDimension(dimension)));
       } else {
-        dims[index] = getDimVals(row, dimension);
+        dims[index] = getDimVals(dimValues.get(dimension), row.getDimension(dimension));
       }
     }
 
@@ -163,8 +172,9 @@ public class IncrementalIndex implements Iterable<Row>
             new MetricSelectorFactory()
             {
               @Override
-              public FloatMetricSelector makeFloatMetricSelector(final String metricName)
+              public FloatMetricSelector makeFloatMetricSelector(String metric)
               {
+                final String metricName = metric.toLowerCase();
                 return new FloatMetricSelector()
                 {
                   @Override
@@ -176,7 +186,7 @@ public class IncrementalIndex implements Iterable<Row>
               }
 
               @Override
-              public ComplexMetricSelector makeComplexMetricSelector(final String metricName)
+              public ComplexMetricSelector makeComplexMetricSelector(final String metric)
               {
                 final String typeName = agg.getTypeName();
                 final ComplexMetricSerde serde = ComplexMetrics.getSerdeForType(typeName);
@@ -186,6 +196,7 @@ public class IncrementalIndex implements Iterable<Row>
                 }
 
                 final ComplexMetricExtractor extractor = serde.getExtractor();
+                final String metricName = metric.toLowerCase();
 
                 return new ComplexMetricSelector()
                 {
@@ -227,20 +238,18 @@ public class IncrementalIndex implements Iterable<Row>
     return numEntries;
   }
 
-  private long getMinTimeMillis()
+  public long getMinTimeMillis()
   {
     return facts.firstKey().getTimestamp();
   }
 
-  private long getMaxTimeMillis()
+  public long getMaxTimeMillis()
   {
     return facts.lastKey().getTimestamp();
   }
 
-  private String[] getDimVals(InputRow row, String dimension)
+  private String[] getDimVals(final DimDim dimLookup, final List<String> dimValues)
   {
-    final DimDim dimLookup = dimValues.getOrAdd(dimension);
-    final List<String> dimValues = row.getDimension(dimension);
     final String[] retVal = new String[dimValues.size()];
 
     int count = 0;
@@ -309,9 +318,19 @@ public class IncrementalIndex implements Iterable<Row>
     return dimensionOrder.get(dimension);
   }
 
+  List<String> getMetricNames()
+  {
+    return metricNames;
+  }
+
   Integer getMetricIndex(String metricName)
   {
     return metricIndexes.get(metricName);
+  }
+
+  ConcurrentSkipListMap<TimeAndDims, Aggregator[]> getFacts()
+  {
+    return facts;
   }
 
   ConcurrentNavigableMap<TimeAndDims, Aggregator[]> getSubMap(TimeAndDims start, TimeAndDims end)
@@ -322,34 +341,52 @@ public class IncrementalIndex implements Iterable<Row>
   @Override
   public Iterator<Row> iterator()
   {
-    return Iterators.transform(
-        facts.entrySet().iterator(),
-        new Function<Map.Entry<TimeAndDims, Aggregator[]>, Row>()
-        {
-          @Override
-          public Row apply(final Map.Entry<TimeAndDims, Aggregator[]> input)
-          {
-            final TimeAndDims timeAndDims = input.getKey();
-            final Aggregator[] aggregators = input.getValue();
+    return iterableWithPostAggregations(null).iterator();
+  }
 
-            String[][] theDims = timeAndDims.getDims();
+  public Iterable<Row> iterableWithPostAggregations(final List<PostAggregator> postAggs)
+  {
+    return new Iterable<Row>()
+    {
+      @Override
+      public Iterator<Row> iterator()
+      {
+        return Iterators.transform(
+            facts.entrySet().iterator(),
+            new Function<Map.Entry<TimeAndDims, Aggregator[]>, Row>()
+            {
+              @Override
+              public Row apply(final Map.Entry<TimeAndDims, Aggregator[]> input)
+              {
+                final TimeAndDims timeAndDims = input.getKey();
+                final Aggregator[] aggregators = input.getValue();
 
-            Map<String, Object> theVals = Maps.newLinkedHashMap();
-            for (int i = 0; i < theDims.length; ++i) {
-              String[] dim = theDims[i];
-              if (dim != null && dim.length != 0) {
-                theVals.put(dimensions.get(i), dim.length == 1 ? dim[0] : Arrays.asList(dim));
+                String[][] theDims = timeAndDims.getDims();
+
+                Map<String, Object> theVals = Maps.newLinkedHashMap();
+                for (int i = 0; i < theDims.length; ++i) {
+                  String[] dim = theDims[i];
+                  if (dim != null && dim.length != 0) {
+                    theVals.put(dimensions.get(i), dim.length == 1 ? dim[0] : Arrays.asList(dim));
+                  }
+                }
+
+                for (int i = 0; i < aggregators.length; ++i) {
+                  theVals.put(metrics[i].getName(), aggregators[i].get());
+                }
+
+                if (postAggs != null) {
+                  for (PostAggregator postAgg : postAggs) {
+                    theVals.put(postAgg.getName(), postAgg.compute(theVals));
+                  }
+                }
+
+                return new MapBasedRow(timeAndDims.getTimestamp(), theVals);
               }
             }
-
-            for (int i = 0; i < aggregators.length; ++i) {
-              theVals.put(metrics[i].getName(), aggregators[i].get());
-            }
-
-            return new MapBasedRow(timeAndDims.getTimestamp(), theVals);
-          }
-        }
-    );
+        );
+      }
+    };
   }
 
   static class DimensionHolder
@@ -366,12 +403,15 @@ public class IncrementalIndex implements Iterable<Row>
       dimensions.clear();
     }
 
-    DimDim getOrAdd(String dimension)
+    DimDim add(String dimension)
     {
       DimDim holder = dimensions.get(dimension);
       if (holder == null) {
         holder = new DimDim();
         dimensions.put(dimension, holder);
+      }
+      else {
+        throw new ISE("dimension[%s] already existed even though add() was called!?", dimension);
       }
       return holder;
     }
@@ -484,7 +524,7 @@ public class IncrementalIndex implements Iterable<Row>
 
     public String get(String value)
     {
-      return poorMansInterning.get(value);
+      return value == null ? null : poorMansInterning.get(value);
     }
 
     public int getId(String value)

@@ -24,6 +24,7 @@ import org.codehaus.jackson.annotate.JsonTypeInfo;
 
 import java.util.Comparator;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Functionally similar to an Aggregator. See the Aggregator interface for more comments.
@@ -36,6 +37,8 @@ import java.util.Map;
 })
 public interface PostAggregator
 {
+  public Set<String> getDependentFields();
+
   public Comparator getComparator();
 
   public Object compute(Map<String, Object> combinedAggregators);

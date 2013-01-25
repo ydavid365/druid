@@ -52,10 +52,7 @@ public abstract class BaseStorageAdapter implements StorageAdapter
     final List<String> dimensions = query.getDimensions();
     final SearchQuerySpec searchQuerySpec = query.getQuery();
 
-    final TreeSet<SearchHit> retVal = Sets.newTreeSet(
-        searchQuerySpec.getSearchSortSpec()
-                       .getComparator()
-    );
+    final TreeSet<SearchHit> retVal = Sets.newTreeSet(query.getSort().getComparator());
 
     Iterable<String> dimsToSearch;
     if (dimensions == null || dimensions.isEmpty()) {
@@ -70,6 +67,7 @@ public abstract class BaseStorageAdapter implements StorageAdapter
       Iterable<String> dims = getDimValueLookup(dimension);
       if (dims != null) {
         for (String dimVal : dims) {
+          dimVal = dimVal == null ? "" : dimVal;
           if (searchQuerySpec.accept(dimVal)) {
             if (filterOffset != null) {
               Offset lhs = new ConciseOffset(getInvertedIndex(dimension, dimVal));
